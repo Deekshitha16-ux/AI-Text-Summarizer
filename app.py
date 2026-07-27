@@ -29,12 +29,20 @@ VIDEO_BATCH_SIZE = 8
 REPEATED_PHRASE_MAX_WORDS = 12
 REPEATED_PHRASE_MIN_OCCURRENCES = 3
 BART_MODEL_NAME = "sshleifer/distilbart-cnn-12-6"
-BART_INPUT_WORDS_PER_CHUNK = 900
+BART_INPUT_WORDS_PER_CHUNK = 700
 BART_COPY_NGRAM_BLOCK = 4
+MIN_TRANSCRIPT_WORDS = 60
+MIN_TRANSCRIPT_SEGMENTS = 3
 BOILERPLATE_LINE_PATTERNS = (
     r"\bback\s+to\s+mail\s+online\s+home\b",
     r"\bback\s+to\s+the\s+page\s+you\s+came\s+from\b",
     r"^back\s+(to|home|from)\b",
+    r"^back\s*page\b",
+    r"\bback\s*page\s+(?:to\s+)?(?:the\s+)?page\s+you\s+came\s+from\b.*",
+    r"\bback\s*page\s+you\s+went\s+viral\b.*",
+    r"\bback\s+(?:top|off|to|scroll)\b.*",
+    r"\bback\s*to\s+(?:the\s+)?(?:top|page|scroll|mail\s+online)\b.*",
+    r"\bbackto\s+to\s+the\s+back\b.*",
     r"^back\s+to\s+.*\s+home$",
     r"^back\s+to\s+the\s+page\s+you\s+came\s+from$",
     r"^mail\s+online\s+home$",
@@ -51,27 +59,104 @@ BOILERPLATE_LINE_PATTERNS = (
     r"\bfor\s+confidential\s+support\s+call\s+the\s+samaritans\b.*",
     r"\bvisit\s+a\s+local\s+samaritans\s+branch\b.*",
     r"\bclick\s+here\s+for\s+details\b",
+    r"\bfor\s+more\s+information\b.*",
+    r"\bvisit\s+(?:www\.)?[a-z0-9.-]+\.[a-z]{2,}\S*\b.*",
+    r"\b(?:https?://|www\.)\S+",
+    r"\b[a-z0-9.-]+\.com(?:/[^\s]*)?.*",
+    r"\bbackward(?:ward|wards)+\b.*",
+    r"\bsnapshots\s+of\s+(?:past|previous|recent)\s+snapshots\b.*",
+    r"\bshare\s+your\s+thoughts\s+with\s+us\b.*",
+    r"\bplease\s+contact\s+us\s+at\b.*",
 )
 SUMMARY_LENGTH_OPTIONS = {
     "Short": {
-        "words": 70,
+        "words": 90,
         "description": "Best for quick revision notes.",
     },
     "Medium": {
-        "words": 130,
+        "words": 180,
         "description": "Balanced detail for assignments and reports.",
     },
     "Long": {
-        "words": 220,
+        "words": 420,
         "description": "More complete coverage for longer documents.",
     },
 }
 COMMON_TRANSCRIPT_FILLERS = (
+    "actually",
+    "basically",
+    "i mean",
+    "kind of",
+    "like",
+    "okay",
+    "right",
+    "so",
+    "sort of",
     "thank you very much for watching this video",
     "thanks for watching",
+    "um",
+    "uh",
+    "yeah",
+    "you know",
     "i'll see you in the next video",
     "see you in the next video",
 )
+SHORT_TRANSCRIPT_FILLERS = {
+    "actually",
+    "basically",
+    "okay",
+    "right",
+    "so",
+    "um",
+    "uh",
+    "yeah",
+}
+NOISY_INLINE_PATTERNS = (
+    r"\bwhat\s+the\s+fuck\s+is\s+this\s*",
+    r"\bu\s+fucking\s+ediot\b.*",
+    r"\bfucking\s+ediot\b.*",
+    r"\bbloddy\s+bitch\b.*",
+    r"\bget\s+off\s+my\s+ass\b.*",
+)
+PROFANITY_WORDS = {
+    "ass",
+    "bastard",
+    "bitch",
+    "bloody",
+    "bloddy",
+    "bullshit",
+    "damn",
+    "dick",
+    "fuck",
+    "fucking",
+    "idiot",
+    "ediot",
+    "shit",
+}
+NAVIGATION_NOISE_WORDS = {
+    "advertisement",
+    "back",
+    "backpage",
+    "backto",
+    "backward",
+    "backwards",
+    "click",
+    "contact",
+    "homepage",
+    "login",
+    "mailonline",
+    "newsletter",
+    "online",
+    "page",
+    "read",
+    "scroll",
+    "share",
+    "sign",
+    "subscribe",
+    "top",
+    "viral",
+    "website",
+}
 
 
 # Load the model once
@@ -232,9 +317,12 @@ def extract_youtube_transcript(url):
     except Exception:
         return "", "No transcript was available for that YouTube video. Try a video with captions enabled."
 
-    transcript_text = clean_transcript_text(" ".join(segment.text for segment in transcript_segments))
+    transcript_parts = [segment.text for segment in transcript_segments if getattr(segment, "text", "").strip()]
+    transcript_text = clean_conversational_transcript(" ".join(transcript_parts))
     if not transcript_text:
         return "", "The video transcript was empty."
+    if len(transcript_parts) < MIN_TRANSCRIPT_SEGMENTS or len(transcript_text.split()) < MIN_TRANSCRIPT_WORDS:
+        return "", "Only a very small part of this YouTube transcript was available, so I cannot generate an accurate summary. Try another video with full captions or paste the full transcript."
     return transcript_text, ""
 
 
@@ -378,14 +466,14 @@ def extract_video_audio_text(file, full_video=True):
                     if os.path.exists(audio_path):
                         os.remove(audio_path)
 
-            return clean_transcript_text(" ".join(transcript_parts))
+            return clean_conversational_transcript(" ".join(transcript_parts))
 
         audio_path = extract_video_audio(video_path)
         if not audio_path:
             return ""
 
         try:
-            return clean_transcript_text(transcribe_audio_file(audio_path, asr_model))
+            return clean_conversational_transcript(transcribe_audio_file(audio_path, asr_model))
         finally:
             if os.path.exists(audio_path):
                 os.remove(audio_path)
@@ -440,6 +528,82 @@ def remove_repeated_phrases(text):
     return " ".join(unique_sentences) if unique_sentences else " ".join(words)
 
 
+def normalize_text_spacing(text):
+    clean_text = re.sub(r"[\u2018\u2019]", "'", text)
+    clean_text = re.sub(r"[\u201c\u201d]", '"', clean_text)
+    clean_text = re.sub(r"\s+", " ", clean_text)
+    clean_text = re.sub(r"(?:^|(?<=[.!?]\s))[,;:\s]+", "", clean_text)
+    clean_text = re.sub(r"\s+([,.;:!?])", r"\1", clean_text)
+    clean_text = re.sub(r"([,;:]){2,}", r"\1", clean_text)
+    clean_text = re.sub(r"([.!?])[,;:]+", r"\1", clean_text)
+    clean_text = re.sub(r"[,;:]+([.!?])", r"\1", clean_text)
+    clean_text = re.sub(r"\s+([,.;:!?])", r"\1", clean_text)
+    clean_text = re.sub(r"([,.;:!?])(?=[A-Za-z])", r"\1 ", clean_text)
+    clean_text = re.sub(r"\.{2,}", ".", clean_text)
+    clean_text = re.sub(r"(?:(?<=^)|(?<=[.!?]\s))[,;:]\s*", "", clean_text)
+    clean_text = re.sub(r"\s+([)\]])", r"\1", clean_text)
+    clean_text = re.sub(r"([(])\s+", r"\1", clean_text)
+    return clean_text.strip()
+
+
+def remove_adjacent_duplicate_words(text):
+    words = text.split()
+    filtered_words = []
+    previous_key = ""
+
+    for word in words:
+        key = re.sub(r"[^a-z0-9]+", "", word.lower())
+        if key and key == previous_key:
+            continue
+        filtered_words.append(word)
+        if key:
+            previous_key = key
+
+    return " ".join(filtered_words)
+
+
+def remove_profane_words(text):
+    words = text.split()
+    filtered_words = []
+
+    for word in words:
+        key = re.sub(r"[^a-z]+", "", word.lower())
+        if key in PROFANITY_WORDS:
+            continue
+        filtered_words.append(word)
+
+    return " ".join(filtered_words)
+
+
+def remove_transcript_fillers(text):
+    clean_text = text
+    for filler in COMMON_TRANSCRIPT_FILLERS:
+        escaped_filler = re.escape(filler)
+        if filler in SHORT_TRANSCRIPT_FILLERS:
+            clean_text = re.sub(
+                rf"(?:(?<=^)|(?<=[.!?,;:\s])){escaped_filler}(?=$|[.!?,;:\s])",
+                " ",
+                clean_text,
+                flags=re.IGNORECASE,
+            )
+        else:
+            clean_text = re.sub(
+                rf"\b{escaped_filler}\b",
+                " ",
+                clean_text,
+                flags=re.IGNORECASE,
+            )
+    return normalize_text_spacing(clean_text)
+
+
+def remove_speaker_labels(text):
+    return re.sub(
+        r"(?:(?<=^)|(?<=[.!?]\s))([A-Z][A-Za-z .'-]{0,35}|Speaker\s+\d+|Interviewer|Guest|Host):\s*",
+        "",
+        text,
+    )
+
+
 def is_boilerplate_text(text):
     normalized = re.sub(r"[^a-z0-9:'\s-]+", "", text.lower()).strip()
     normalized = " ".join(normalized.split())
@@ -452,10 +616,72 @@ def is_boilerplate_text(text):
     )
 
 
+def has_repeated_word_noise(words):
+    if len(words) < 6:
+        return False
+
+    repeated_adjacent = sum(
+        1
+        for index in range(1, len(words))
+        if words[index] == words[index - 1]
+    )
+    if repeated_adjacent >= 3:
+        return True
+
+    unique_ratio = len(set(words)) / len(words)
+    most_common_count = max(words.count(word) for word in set(words))
+    return unique_ratio < 0.45 and most_common_count >= 3
+
+
+def is_low_quality_sentence(text):
+    normalized = re.sub(r"[^a-z0-9.'/:@-]+", " ", text.lower()).strip()
+    normalized = " ".join(normalized.split())
+    if not normalized:
+        return True
+
+    words = re.findall(r"[a-z][a-z'-]*", normalized)
+    if not words:
+        return True
+
+    url_count = len(re.findall(r"(?:https?://|www\.|[a-z0-9.-]+\.(?:com|org|net|in|edu|gov)\b)", normalized))
+    profanity_count = sum(1 for word in words if word in PROFANITY_WORDS)
+    navigation_count = sum(1 for word in words if word in NAVIGATION_NOISE_WORDS)
+    alphabetic_chars = sum(1 for char in normalized if char.isalpha())
+
+    if profanity_count >= 2 and len(words) < 14:
+        return True
+    if profanity_count and len(words) - profanity_count < 5:
+        return True
+    if url_count and len(words) < 18:
+        return True
+    if url_count >= 2:
+        return True
+    if navigation_count >= 3 and navigation_count / len(words) > 0.25:
+        return True
+    if normalized.startswith(("back ", "share ", "subscribe ", "advertisement", "read more", "sign in", "log in")):
+        return True
+    if has_repeated_word_noise(words):
+        return True
+    if len(words) >= 8 and alphabetic_chars / max(1, len(normalized)) < 0.55:
+        return True
+
+    return False
+
+
 def remove_boilerplate_text(text):
-    clean_text = " ".join(text.split())
+    clean_text = normalize_text_spacing(text)
     if not clean_text:
         return ""
+
+    for pattern in NOISY_INLINE_PATTERNS:
+        clean_text = re.sub(
+            pattern,
+            " ",
+            clean_text,
+            flags=re.IGNORECASE,
+        )
+
+    clean_text = remove_profane_words(clean_text)
 
     for pattern in BOILERPLATE_LINE_PATTERNS:
         clean_text = re.sub(
@@ -470,12 +696,112 @@ def remove_boilerplate_text(text):
         for part in re.split(r"(?<=[.!?])\s+|[\r\n]+", clean_text)
         if part.strip()
     ]
-    filtered_parts = [part for part in parts if not is_boilerplate_text(part)]
-    return " ".join(filtered_parts) if filtered_parts else clean_text
+    filtered_parts = []
+    for part in parts:
+        cleaned_part = normalize_text_spacing(remove_adjacent_duplicate_words(part))
+        if not is_boilerplate_text(cleaned_part) and not is_low_quality_sentence(cleaned_part):
+            filtered_parts.append(cleaned_part)
+    return normalize_text_spacing(" ".join(filtered_parts)) if filtered_parts else clean_text
+
+
+def remove_repeated_list_items(text):
+    def dedupe_items(items):
+        unique_items = []
+        seen_items = set()
+        for item in items:
+            clean_item = re.sub(r"^(including|such as|like)\s+", "", item.strip(" ,."), flags=re.IGNORECASE)
+            key = re.sub(r"\s+", " ", clean_item.lower())
+            if key and key not in seen_items:
+                seen_items.add(key)
+                unique_items.append(clean_item)
+        return unique_items
+
+    def join_items(items):
+        if len(items) <= 1:
+            return ""
+        if len(items) == 2:
+            return " and ".join(items)
+        return ", ".join(items[:-1]) + ", and " + items[-1]
+
+    def dedupe_intro_list(match):
+        intro = match.group(1)
+        list_text = match.group(2)
+        items = re.split(r"\s*,\s*|\s+and\s+", list_text, flags=re.IGNORECASE)
+        unique_items = dedupe_items(items)
+        if len(unique_items) <= 1:
+            return match.group(0)
+        return f"{intro} {join_items(unique_items)}"
+
+    text = re.sub(
+        r"\b(including|such as|like)\s+([^.!?;]+)",
+        dedupe_intro_list,
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    return text
+
+
+def remove_unsupported_attributions(summary, source_text):
+    source_lower = source_text.lower()
+    unsupported_role_claims = (
+        "founder",
+        "co-founder",
+        "chairman",
+        "president",
+        "owner",
+    )
+    for role in unsupported_role_claims:
+        if role not in source_lower:
+            summary = re.sub(
+                rf"\s*(?:and|,)?\s*(?:the\s+)?{re.escape(role)}(?:\s+of\s+[^,.!?]+)?",
+                "",
+                summary,
+                flags=re.IGNORECASE,
+            )
+
+    if "dr." not in source_lower and not re.search(r"\bdoctor\s+[A-Z][a-z]+", source_text):
+        summary = re.sub(
+            r"\bDr\.?\s+[A-Z][a-z]+.*?(?<=[.!?])(?=\s|$)",
+            " ",
+            summary,
+            flags=re.IGNORECASE,
+        )
+    if not re.search(r"\b(says|said|adds|added|claims|claimed)\b", source_lower):
+        summary = re.sub(
+            r"\b(he|she|they)\s+(says|said|adds|added|claims|claimed)\b.*?(?<=[.!?])(?=\s|$)",
+            " ",
+            summary,
+            flags=re.IGNORECASE,
+        )
+
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", summary)
+        if sentence.strip()
+    ]
+    filtered_sentences = []
+
+    for sentence in sentences:
+        sentence_lower = sentence.lower()
+        invented_doctor = re.search(r"\bdr\.?\s+[A-Z][a-z]+", sentence, flags=re.IGNORECASE) and "dr." not in source_lower
+        invented_quote_style = (
+            re.search(r"\b(he|she|they)\s+(says|said|adds|added|claims|claimed)\b", sentence_lower)
+            and not re.search(r"\b(says|said|adds|added|claims|claimed)\b", source_lower)
+        )
+        if invented_doctor or invented_quote_style:
+            continue
+        filtered_sentences.append(sentence)
+
+    return " ".join(filtered_sentences) if filtered_sentences else summary
 
 
 def clean_transcript_text(text):
-    clean_text = remove_boilerplate_text(remove_repeated_phrases(text))
+    clean_text = normalize_text_spacing(text)
+    clean_text = remove_repeated_phrases(clean_text)
+    clean_text = remove_boilerplate_text(clean_text)
+    clean_text = remove_adjacent_duplicate_words(clean_text)
+    clean_text = remove_repeated_list_items(clean_text)
     for filler in COMMON_TRANSCRIPT_FILLERS:
         clean_text = re.sub(
             rf"(?:\b{re.escape(filler)}\b[\s,.;:!-]*){{2,}}",
@@ -483,7 +809,15 @@ def clean_transcript_text(text):
             clean_text,
             flags=re.IGNORECASE,
         )
-    return " ".join(clean_text.split())
+    return normalize_text_spacing(clean_text)
+
+
+def clean_conversational_transcript(text):
+    clean_text = normalize_text_spacing(text)
+    clean_text = remove_speaker_labels(clean_text)
+    clean_text = remove_transcript_fillers(clean_text)
+    clean_text = clean_transcript_text(clean_text)
+    return normalize_text_spacing(clean_text)
 
 
 def extractive_summary(clean_text, target_words):
@@ -553,10 +887,50 @@ def chunk_text_by_words(text, words_per_chunk):
 def target_abstractive_words(input_word_count, target_words):
     if input_word_count <= 35:
         return min(target_words, input_word_count)
-    return max(25, min(target_words, int(input_word_count * 0.35)))
+    return max(45, min(target_words, int(input_word_count * 0.75)))
 
 
-def generate_bart_summary(tokenizer, model, text, max_tokens, min_tokens):
+def has_summary_quality_issue(summary, source_text, target_words):
+    summary_words = summary.split()
+    if not summary_words:
+        return True
+    source_word_count = len(source_text.split())
+    if source_word_count > 250 and target_words < source_word_count and len(summary_words) < min(70, target_words * 0.45):
+        return True
+    if has_repeated_word_noise([re.sub(r"[^a-z0-9]+", "", word.lower()) for word in summary_words if word.strip()]):
+        return True
+
+    sentences = [
+        sentence.strip().lower()
+        for sentence in re.split(r"(?<=[.!?])\s+", summary)
+        if sentence.strip()
+    ]
+    if len(sentences) != len(set(sentences)):
+        return True
+
+    return False
+
+
+def fallback_summary_target(input_word_count, target_words):
+    if input_word_count <= 80:
+        return max(35, min(input_word_count, target_words))
+    return max(60, min(target_words, int(input_word_count * 0.65)))
+
+
+def token_limits_for_target(target_words, chunk_count=1, detail_level="medium"):
+    per_chunk_words = max(60, int(target_words / max(1, chunk_count)))
+    if detail_level == "long":
+        max_tokens = max(170, min(520, int(per_chunk_words * 2.25)))
+        min_tokens = max(80, min(360, int(per_chunk_words * 1.25)))
+    else:
+        max_tokens = max(120, min(420, int(per_chunk_words * 1.8)))
+        min_tokens = max(45, min(240, int(per_chunk_words * 0.9)))
+    if min_tokens >= max_tokens:
+        min_tokens = max(30, max_tokens - 20)
+    return max_tokens, min_tokens
+
+
+def generate_bart_summary(tokenizer, model, text, max_tokens, min_tokens, detail_level="medium"):
     inputs = tokenizer(
         text,
         max_length=1024,
@@ -569,11 +943,11 @@ def generate_bart_summary(tokenizer, model, text, max_tokens, min_tokens):
             attention_mask=inputs["attention_mask"],
             max_length=max_tokens,
             min_length=min_tokens,
-            num_beams=2,
+            num_beams=3,
             no_repeat_ngram_size=3,
             encoder_no_repeat_ngram_size=BART_COPY_NGRAM_BLOCK,
-            length_penalty=1.2,
-            early_stopping=True,
+            length_penalty=1.25 if detail_level == "long" else 1.0,
+            early_stopping=False if detail_level == "long" else True,
         )
     return tokenizer.decode(summary_ids[0], skip_special_tokens=True).strip()
 
@@ -586,11 +960,12 @@ def abstractive_summary(clean_text, target_words):
     if not chunks:
         return ""
 
-    chunk_target_words = max(25, int(desired_words / len(chunks)))
-    max_tokens_per_chunk = max(35, min(180, int(chunk_target_words * 1.35)))
-    min_tokens_per_chunk = max(12, min(80, int(chunk_target_words * 0.45)))
-    if min_tokens_per_chunk >= max_tokens_per_chunk:
-        min_tokens_per_chunk = max(8, max_tokens_per_chunk - 10)
+    detail_level = "long" if target_words >= SUMMARY_LENGTH_OPTIONS["Long"]["words"] else "medium"
+    max_tokens_per_chunk, min_tokens_per_chunk = token_limits_for_target(
+        desired_words,
+        len(chunks),
+        detail_level,
+    )
 
     summaries = [
         generate_bart_summary(
@@ -599,6 +974,7 @@ def abstractive_summary(clean_text, target_words):
             chunk,
             max_tokens_per_chunk,
             min_tokens_per_chunk,
+            detail_level,
         )
         for chunk in chunks
     ]
@@ -607,17 +983,34 @@ def abstractive_summary(clean_text, target_words):
     if not summary:
         return ""
 
-    if len(chunks) > 2 or len(summary.split()) > desired_words * 1.35:
-        final_max_tokens = max(30, min(220, int(desired_words * 1.25)))
-        final_min_tokens = max(10, min(90, int(desired_words * 0.45)))
-        if final_min_tokens >= final_max_tokens:
-            final_min_tokens = max(8, final_max_tokens - 10)
+    # Short and medium summaries should be tightly condensed. Long summaries should
+    # keep coverage from each source chunk and only be compressed when clearly too long.
+    should_compress_merged_summary = (
+        detail_level != "long" and len(chunks) > 1
+    ) or len(summary.split()) > desired_words * 1.35
+    if should_compress_merged_summary:
+        final_max_tokens, final_min_tokens = token_limits_for_target(desired_words, detail_level=detail_level)
         summary = generate_bart_summary(
             tokenizer,
             model,
             summary,
             final_max_tokens,
             final_min_tokens,
+            detail_level,
+        )
+
+    if input_word_count > 350 and len(summary.split()) < desired_words * 0.55:
+        retry_max_tokens, retry_min_tokens = token_limits_for_target(
+            int(desired_words * 1.15),
+            detail_level=detail_level,
+        )
+        summary = generate_bart_summary(
+            tokenizer,
+            model,
+            clean_text,
+            retry_max_tokens,
+            retry_min_tokens,
+            detail_level,
         )
 
     return " ".join(summary.split()[:desired_words])
@@ -629,17 +1022,38 @@ def generate_summary(text, target_words, use_abstractive=False):
     if input_word_count == 0:
         return ""
 
+    fallback_target_words = fallback_summary_target(input_word_count, target_words)
+
     if use_abstractive:
         summary = abstractive_summary(clean_text, target_words)
-        if summary and summary.strip().lower() != clean_text.strip().lower():
+        if (
+            summary
+            and summary.strip().lower() != clean_text.strip().lower()
+            and not has_summary_quality_issue(summary, clean_text, target_words)
+        ):
             return summary
-        return "The model could not create a shorter generated summary for this input. Try adding more text or choosing a lower target word count."
+        fallback_summary = extractive_summary(clean_text, fallback_target_words)
+        if fallback_summary:
+            return fallback_summary
+        return clean_text
 
-    return abstractive_summary(clean_text, target_words)
+    summary = abstractive_summary(clean_text, target_words)
+    if has_summary_quality_issue(summary, clean_text, target_words):
+        return extractive_summary(clean_text, fallback_target_words)
+    return summary
 
 
-def clean_summary_output(summary):
-    return remove_boilerplate_text(summary)
+def clean_summary_output(summary, source_text=""):
+    clean_summary = remove_boilerplate_text(summary)
+    clean_summary = remove_repeated_phrases(clean_summary)
+    clean_summary = remove_repeated_list_items(clean_summary)
+    clean_summary = remove_adjacent_duplicate_words(clean_summary)
+    if source_text:
+        clean_summary = remove_unsupported_attributions(clean_summary, source_text)
+    clean_summary = normalize_text_spacing(clean_summary)
+    if clean_summary and clean_summary[-1] not in ".!?":
+        clean_summary += "."
+    return clean_summary
 
 st.set_page_config(
     page_title="AI Text Summarizer",
@@ -1323,7 +1737,7 @@ if generate_clicked:
                 summary_target_words,
                 use_abstractive=True,
             )
-            summary = clean_summary_output(summary)
+            summary = clean_summary_output(summary, text)
 
         st.markdown('<div class="panel-title" style="margin-top:1.2rem;">Generated Summary</div>', unsafe_allow_html=True)
         st.markdown(f'<div class="output-box summary-box">{html.escape(summary)}</div>', unsafe_allow_html=True)
