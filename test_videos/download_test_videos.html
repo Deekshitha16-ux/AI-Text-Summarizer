@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Test Video Downloads</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 40px;
+      color: #111827;
+      background: #f9fafb;
+    }
+
+    main {
+      max-width: 720px;
+    }
+
+    a {
+      display: inline-block;
+      margin: 8px 0 20px;
+      padding: 10px 14px;
+      color: white;
+      background: #2563eb;
+      border-radius: 6px;
+      text-decoration: none;
+      font-weight: 700;
+    }
+
+    video {
+      display: block;
+      width: 100%;
+      max-width: 640px;
+      margin: 8px 0 24px;
+      background: #111827;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Test Video Downloads</h1>
+
+    <h2>Short Test Video</h2>
+    <a href="short_test_video.mp4" download>Download short_test_video.mp4</a>
+    <video controls src="short_test_video.mp4"></video>
+
+    <h2>Long Test Video</h2>
+    <a href="long_test_video.mp4" download>Download long_test_video.mp4</a>
+    <video controls src="long_test_video.mp4"></video>
+  </main>
+</body>
+</html>
