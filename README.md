@@ -174,20 +174,7 @@ AI-Text-Summarizer/
 
 ---
 
-## 📷 Screenshots
 
-Add screenshots of your application here.
-
-Example:
-
-- Home Page
-- Text Summarization
-- PDF Upload
-- URL Summarization
-- Video Summarization
-- Generated Summary
-
----
 
 ## 🎯 Applications
 
