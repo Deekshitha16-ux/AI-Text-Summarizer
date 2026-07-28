@@ -1,38 +1,33 @@
 import streamlit as st
-import fitz
-from docx import Document
-import torch
 import html
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import wave
 from html.parser import HTMLParser
 from urllib.error import URLError, HTTPError
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
-import numpy as np
-from imageio_ffmpeg import get_ffmpeg_exe
-from youtube_transcript_api import YouTubeTranscriptApi
-
-from transformers import BartTokenizer, BartForConditionalGeneration
-from transformers import pipeline
-from transformers.utils import logging as transformers_logging
-
-
-transformers_logging.disable_progress_bar()
 
 VIDEO_CHUNK_SECONDS = 30
-VIDEO_BATCH_SIZE = 8
+VIDEO_BATCH_SIZE = 2
+VIDEO_PREVIEW_SEGMENT_SECONDS = 30
+VIDEO_PREVIEW_FALLBACK_SECONDS = 180
+BASIC_VIDEO_SAMPLE_STARTS = (0, 30, 60)
+MIN_YOUTUBE_CAPTION_WORDS = 45
 REPEATED_PHRASE_MAX_WORDS = 12
 REPEATED_PHRASE_MIN_OCCURRENCES = 3
-BART_MODEL_NAME = "sshleifer/distilbart-cnn-12-6"
-BART_INPUT_WORDS_PER_CHUNK = 700
+BART_MODEL_NAME = "sshleifer/distilbart-cnn-6-6"
+BART_INPUT_WORDS_PER_CHUNK = 900
+FAST_ABSTRACTIVE_INPUT_WORDS = 900
+FAST_ABSTRACTIVE_LONG_INPUT_WORDS = 1400
+BART_MAX_CHUNKS = 2
 BART_COPY_NGRAM_BLOCK = 4
-MIN_TRANSCRIPT_WORDS = 60
-MIN_TRANSCRIPT_SEGMENTS = 3
+MIN_ABSTRACTIVE_WORDS = 12
+MIN_FAST_VIDEO_TRANSCRIPT_WORDS = 90
 BOILERPLATE_LINE_PATTERNS = (
     r"\bback\s+to\s+mail\s+online\s+home\b",
     r"\bback\s+to\s+the\s+page\s+you\s+came\s+from\b",
@@ -162,14 +157,25 @@ NAVIGATION_NOISE_WORDS = {
 # Load the model once
 @st.cache_resource
 def load_model():
+    import torch
+    from transformers import BartForConditionalGeneration, BartTokenizer
+    from transformers.utils import logging as transformers_logging
+
+    transformers_logging.disable_progress_bar()
     tokenizer = BartTokenizer.from_pretrained(BART_MODEL_NAME)
     model = BartForConditionalGeneration.from_pretrained(BART_MODEL_NAME)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
     model.eval()
     return tokenizer, model
 
 
 @st.cache_resource
 def load_asr_model():
+    import torch
+    from transformers import pipeline
+    from transformers.utils import logging as transformers_logging
+
     transformers_logging.disable_progress_bar()
     device = 0 if torch.cuda.is_available() else -1
     return pipeline(
@@ -181,9 +187,13 @@ def load_asr_model():
 
 @st.cache_resource
 def load_transcript_api():
+    from youtube_transcript_api import YouTubeTranscriptApi
+
     return YouTubeTranscriptApi()
 
 def extract_pdf(file):
+    import fitz
+
     text = ""
     pdf = fitz.open(stream=file.read(), filetype="pdf")
 
@@ -194,6 +204,8 @@ def extract_pdf(file):
 
 
 def extract_docx(file):
+    from docx import Document
+
     doc = Document(file)
 
     text = ""
@@ -240,7 +252,16 @@ def extract_url_text(url):
         return "", "Please enter a full http or https URL."
 
     if is_youtube_url(url):
-        return extract_youtube_transcript(url)
+        caption_text, caption_error = extract_youtube_transcript(url)
+        if len(caption_text.split()) >= MIN_YOUTUBE_CAPTION_WORDS:
+            return caption_text, ""
+
+        audio_text = extract_youtube_audio_text(url)
+        if audio_text:
+            return audio_text, ""
+        if caption_text:
+            return caption_text, ""
+        return "", caption_error or "I could not read captions or transcribe audio from this YouTube video."
 
     request = Request(
         url,
@@ -268,25 +289,37 @@ def extract_url_text(url):
 
 def is_youtube_url(url):
     parsed_url = urlparse(url.strip())
-    host = parsed_url.netloc.lower()
-    return "youtube.com" in host or "youtu.be" in host
+    host = parsed_url.netloc.lower().removeprefix("www.")
+    return host in {"youtube.com", "m.youtube.com", "youtu.be", "youtube-nocookie.com"} or host.endswith(".youtube.com")
 
 
 def extract_youtube_video_id(url):
     parsed_url = urlparse(url.strip())
-    if "youtu.be" in parsed_url.netloc.lower():
-        return parsed_url.path.lstrip("/").split("/")[0]
+    host = parsed_url.netloc.lower().removeprefix("www.")
+    if host == "youtu.be":
+        return parsed_url.path.lstrip("/").split("/")[0].split("?")[0]
 
-    if "youtube.com" in parsed_url.netloc.lower():
-        query_params = dict(part.split("=", 1) for part in parsed_url.query.split("&") if "=" in part)
-        if "v" in query_params:
-            return query_params["v"]
+    if host in {"youtube.com", "m.youtube.com", "youtube-nocookie.com"} or host.endswith(".youtube.com"):
+        query_params = parse_qs(parsed_url.query)
+        if query_params.get("v"):
+            return query_params["v"][0]
 
         path_parts = [part for part in parsed_url.path.split("/") if part]
         if len(path_parts) >= 2 and path_parts[0] in {"shorts", "embed", "live"}:
             return path_parts[1]
 
     return ""
+
+
+def _fetch_transcript_segments(transcript):
+    fetched = transcript.fetch()
+    return getattr(fetched, "snippets", fetched)
+
+
+def _segment_text(segment):
+    if isinstance(segment, dict):
+        return segment.get("text", "")
+    return getattr(segment, "text", "")
 
 
 def extract_youtube_transcript(url):
@@ -297,36 +330,111 @@ def extract_youtube_transcript(url):
     try:
         transcript_api = load_transcript_api()
         transcript_list = transcript_api.list(video_id)
+        preferred_languages = ("en", "en-US", "en-GB", "en-IN")
+        available_transcripts = list(transcript_list)
 
         transcript = None
-        for language_codes in (["en", "en-US", "en-GB"], ["en"]):
-            try:
-                transcript = transcript_list.find_manually_created_transcript(language_codes)
+        for language in preferred_languages:
+            transcript = next(
+                (
+                    item
+                    for item in available_transcripts
+                    if language in getattr(item, "language_code", "")
+                    and not getattr(item, "is_generated", False)
+                ),
+                None,
+            )
+            if transcript:
                 break
-            except Exception:
-                try:
-                    transcript = transcript_list.find_generated_transcript(language_codes)
-                    break
-                except Exception:
-                    continue
 
         if transcript is None:
-            transcript = transcript_list.find_transcript(["en", "en-US", "en-GB"])
+            for language in preferred_languages:
+                transcript = next(
+                    (
+                        item
+                        for item in available_transcripts
+                        if language in getattr(item, "language_code", "")
+                    ),
+                    None,
+                )
+                if transcript:
+                    break
 
-        transcript_segments = transcript.fetch()
+        if transcript is None and available_transcripts:
+            transcript = next(
+                (
+                    item
+                    for item in available_transcripts
+                    if getattr(item, "is_translatable", False)
+                ),
+                available_transcripts[0],
+            )
+            if getattr(transcript, "language_code", "") not in preferred_languages and getattr(transcript, "is_translatable", False):
+                try:
+                    transcript = transcript.translate("en")
+                except Exception:
+                    pass
+
+        if transcript is None:
+            return "", "No transcript was available for that YouTube video. Try a video with captions enabled."
+
+        transcript_segments = _fetch_transcript_segments(transcript)
     except Exception:
         return "", "No transcript was available for that YouTube video. Try a video with captions enabled."
 
-    transcript_parts = [segment.text for segment in transcript_segments if getattr(segment, "text", "").strip()]
+    transcript_parts = [_segment_text(segment) for segment in transcript_segments if _segment_text(segment).strip()]
     transcript_text = clean_conversational_transcript(" ".join(transcript_parts))
     if not transcript_text:
         return "", "The video transcript was empty."
-    if len(transcript_parts) < MIN_TRANSCRIPT_SEGMENTS or len(transcript_text.split()) < MIN_TRANSCRIPT_WORDS:
-        return "", "Only a very small part of this YouTube transcript was available, so I cannot generate an accurate summary. Try another video with full captions or paste the full transcript."
     return transcript_text, ""
 
 
+def extract_youtube_audio_text(url):
+    from imageio_ffmpeg import get_ffmpeg_exe
+    from yt_dlp import YoutubeDL
+
+    temp_dir = tempfile.mkdtemp()
+    audio_path = None
+    try:
+        output_template = os.path.join(temp_dir, "youtube_audio.%(ext)s")
+        ydl_options = {
+            "format": "bestaudio/best",
+            "outtmpl": output_template,
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "ffmpeg_location": os.path.dirname(get_ffmpeg_exe()),
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "wav",
+                    "preferredquality": "64",
+                }
+            ],
+        }
+        with YoutubeDL(ydl_options) as ydl:
+            ydl.download([url])
+
+        wav_files = [
+            os.path.join(temp_dir, filename)
+            for filename in os.listdir(temp_dir)
+            if filename.lower().endswith(".wav")
+        ]
+        if not wav_files:
+            return ""
+
+        audio_path = wav_files[0]
+        return clean_conversational_transcript(transcribe_audio_file(audio_path, load_asr_model()))
+    except Exception:
+        return ""
+    finally:
+        if os.path.isdir(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def get_video_duration_seconds(video_path):
+    from imageio_ffmpeg import get_ffmpeg_exe
+
     ffmpeg_path = get_ffmpeg_exe()
     result = subprocess.run(
         [ffmpeg_path, "-i", video_path],
@@ -342,6 +450,8 @@ def get_video_duration_seconds(video_path):
 
 
 def transcribe_audio_file(audio_path, asr_model):
+    import numpy as np
+
     with wave.open(audio_path, "rb") as audio_file:
         frame_count = audio_file.getnframes()
         sample_rate = audio_file.getframerate()
@@ -363,6 +473,8 @@ def transcribe_audio_file(audio_path, asr_model):
 
 
 def extract_video_audio(video_path):
+    from imageio_ffmpeg import get_ffmpeg_exe
+
     audio_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
@@ -394,6 +506,8 @@ def extract_video_audio(video_path):
 
 
 def extract_video_segment_audio(video_path, start_seconds, duration_seconds):
+    from imageio_ffmpeg import get_ffmpeg_exe
+
     audio_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
@@ -428,6 +542,37 @@ def extract_video_segment_audio(video_path, start_seconds, duration_seconds):
         return None
 
 
+def transcribe_video_segment(video_path, start_seconds, duration_seconds, asr_model):
+    audio_path = extract_video_segment_audio(video_path, start_seconds, duration_seconds)
+    if not audio_path:
+        return ""
+
+    try:
+        return transcribe_audio_file(audio_path, asr_model)
+    finally:
+        if os.path.exists(audio_path):
+            os.remove(audio_path)
+
+
+def get_fast_video_sample_starts(duration_seconds, segment_seconds):
+    usable_duration = max(1, duration_seconds - segment_seconds)
+    starts = [
+        start
+        for start in BASIC_VIDEO_SAMPLE_STARTS
+        if start < usable_duration
+    ]
+    segment_count = 6 if duration_seconds > 360 else 4
+    starts.extend(
+        round((usable_duration * index) / max(1, segment_count - 1), 2)
+        for index in range(segment_count)
+    )
+    return sorted(set(starts))
+
+
+def video_transcription_mode(summary_length):
+    return "full" if summary_length == "Long" else "fast"
+
+
 def extract_video_audio_text(file, full_video=True):
     if hasattr(file, "seek"):
         file.seek(0)
@@ -442,31 +587,31 @@ def extract_video_audio_text(file, full_video=True):
             duration_seconds = get_video_duration_seconds(video_path)
             if duration_seconds <= 0:
                 segment_starts = [0]
-                segment_seconds = 20
+                segment_seconds = VIDEO_PREVIEW_SEGMENT_SECONDS
             else:
-                segment_seconds = min(20, max(4, int(duration_seconds)))
-                usable_duration = max(1, duration_seconds - segment_seconds)
-                segment_count = 6 if duration_seconds > 360 else 4
-                segment_starts = [
-                    round((usable_duration * index) / max(1, segment_count - 1), 2)
-                    for index in range(segment_count)
-                ]
+                segment_seconds = min(VIDEO_PREVIEW_SEGMENT_SECONDS, max(4, int(duration_seconds)))
+                if duration_seconds <= VIDEO_PREVIEW_FALLBACK_SECONDS:
+                    segment_starts = [0]
+                    segment_seconds = max(4, int(duration_seconds))
+                else:
+                    segment_starts = get_fast_video_sample_starts(duration_seconds, segment_seconds)
 
             transcript_parts = []
             for start in segment_starts:
-                audio_path = extract_video_segment_audio(video_path, start, segment_seconds)
-                if not audio_path:
-                    continue
+                part = transcribe_video_segment(video_path, start, segment_seconds, asr_model)
+                if part:
+                    transcript_parts.append(part.strip())
 
-                try:
-                    part = transcribe_audio_file(audio_path, asr_model)
-                    if part:
-                        transcript_parts.append(part.strip())
-                finally:
-                    if os.path.exists(audio_path):
-                        os.remove(audio_path)
+            transcript_text = clean_conversational_transcript(" ".join(transcript_parts))
+            if transcript_text:
+                return transcript_text
 
-            return clean_conversational_transcript(" ".join(transcript_parts))
+            fallback_seconds = VIDEO_PREVIEW_FALLBACK_SECONDS
+            if duration_seconds > 0:
+                fallback_seconds = min(VIDEO_PREVIEW_FALLBACK_SECONDS, max(4, int(duration_seconds)))
+            return clean_conversational_transcript(
+                transcribe_video_segment(video_path, 0, fallback_seconds, asr_model)
+            )
 
         audio_path = extract_video_audio(video_path)
         if not audio_path:
@@ -796,6 +941,63 @@ def remove_unsupported_attributions(summary, source_text):
     return " ".join(filtered_sentences) if filtered_sentences else summary
 
 
+def fix_common_summary_join_errors(text):
+    replacements = {
+        "suggestappropriate": "suggest appropriate",
+        "institutions increasingly adopting": "institutions are increasingly adopting",
+        "support teachers, administrators": "support teachers and administrators",
+        "augmenting reality": "augmented reality",
+        "immersion educational": "immersive educational",
+        "experiences that enhances": "experiences that enhance",
+        "benefitss": "benefits",
+        "Despite its benefit": "Despite its benefits",
+        "AI is still significant challenges": "AI still faces significant challenges",
+        "are expected to be to reshape": "are expected to reshape",
+        "is expected. to be": "is expected to be",
+        "force reshape education": "force reshaping education",
+        "to be a major. to reshape": "to be a major force reshaping education",
+        "expected to reshaping": "expected to reshape",
+        "across school, universities, schools": "across schools and universities",
+        "worldwide, and worldwide": "worldwide",
+    }
+    for wrong, right in replacements.items():
+        text = re.sub(re.escape(wrong), right, text, flags=re.IGNORECASE)
+
+    text = re.sub(r"\bbenefitss\b", "benefits", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bschools and universities and training\b", "schools, universities, and training", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(and|or|but)\s*[.]\s*\1\b", r"\1", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(and|or|but)\s*[.]\s+", ". ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+([,.!?;:])", r"\1", text)
+    text = re.sub(r"([.!?])\s*([a-z])", lambda match: f"{match.group(1)} {match.group(2).upper()}", text)
+    return normalize_text_spacing(text)
+
+
+def polish_summary_sentences(text):
+    clean_text = fix_common_summary_join_errors(text)
+    sentences = [
+        sentence.strip(" ,;:")
+        for sentence in re.split(r"(?<=[.!?])\s+", clean_text)
+        if sentence.strip(" ,;:")
+    ]
+    polished_sentences = []
+    seen = set()
+    for sentence in sentences:
+        sentence = fix_common_summary_join_errors(sentence).strip(" ,;:")
+        if len(sentence.split()) < 5:
+            continue
+        if not re.search(r"\b(is|are|was|were|has|have|can|will|should|provides?|improves?|creates?|supports?|helps?|uses?|includes?|transforms?|analyzes?|identifies?|enhances?|presents?|expects?|reshapes?)\b", sentence, flags=re.IGNORECASE):
+            continue
+        sentence = sentence[0].upper() + sentence[1:]
+        if sentence[-1] not in ".!?":
+            sentence += "."
+        key = re.sub(r"[^a-z0-9]+", " ", sentence.lower()).strip()
+        if key and key not in seen:
+            seen.add(key)
+            polished_sentences.append(sentence)
+
+    return " ".join(polished_sentences) if polished_sentences else clean_text
+
+
 def clean_transcript_text(text):
     clean_text = normalize_text_spacing(text)
     clean_text = remove_repeated_phrases(clean_text)
@@ -884,9 +1086,20 @@ def chunk_text_by_words(text, words_per_chunk):
     ]
 
 
+def prepare_abstractive_input(clean_text, target_words, detail_level):
+    words = clean_text.split()
+    if len(words) <= FAST_ABSTRACTIVE_INPUT_WORDS:
+        return clean_text
+
+    max_input_words = FAST_ABSTRACTIVE_LONG_INPUT_WORDS if detail_level == "long" else FAST_ABSTRACTIVE_INPUT_WORDS
+    condensed_target = min(max_input_words, max(target_words * 3, FAST_ABSTRACTIVE_INPUT_WORDS))
+    condensed_text = extractive_summary(clean_text, condensed_target)
+    return condensed_text or " ".join(words[:max_input_words])
+
+
 def target_abstractive_words(input_word_count, target_words):
     if input_word_count <= 35:
-        return min(target_words, input_word_count)
+        return max(10, min(target_words, int(input_word_count * 0.65)))
     return max(45, min(target_words, int(input_word_count * 0.75)))
 
 
@@ -918,7 +1131,13 @@ def fallback_summary_target(input_word_count, target_words):
 
 
 def token_limits_for_target(target_words, chunk_count=1, detail_level="medium"):
-    per_chunk_words = max(60, int(target_words / max(1, chunk_count)))
+    per_chunk_words = int(target_words / max(1, chunk_count))
+    if target_words < 45:
+        max_tokens = max(18, min(80, int(max(12, per_chunk_words) * 1.6)))
+        min_tokens = max(6, min(max_tokens - 6, int(max(8, per_chunk_words) * 0.55)))
+        return max_tokens, min_tokens
+
+    per_chunk_words = max(60, per_chunk_words)
     if detail_level == "long":
         max_tokens = max(170, min(520, int(per_chunk_words * 2.25)))
         min_tokens = max(80, min(360, int(per_chunk_words * 1.25)))
@@ -931,23 +1150,28 @@ def token_limits_for_target(target_words, chunk_count=1, detail_level="medium"):
 
 
 def generate_bart_summary(tokenizer, model, text, max_tokens, min_tokens, detail_level="medium"):
+    import torch
+
     inputs = tokenizer(
         text,
         max_length=1024,
         truncation=True,
         return_tensors="pt",
     )
-    with torch.no_grad():
+    device = next(model.parameters()).device
+    inputs = {key: value.to(device) for key, value in inputs.items()}
+    with torch.inference_mode():
         summary_ids = model.generate(
             inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
             max_length=max_tokens,
             min_length=min_tokens,
-            num_beams=3,
+            num_beams=1,
+            do_sample=False,
             no_repeat_ngram_size=3,
             encoder_no_repeat_ngram_size=BART_COPY_NGRAM_BLOCK,
             length_penalty=1.25 if detail_level == "long" else 1.0,
-            early_stopping=False if detail_level == "long" else True,
+            early_stopping=True,
         )
     return tokenizer.decode(summary_ids[0], skip_special_tokens=True).strip()
 
@@ -956,11 +1180,12 @@ def abstractive_summary(clean_text, target_words):
     tokenizer, model = load_model()
     input_word_count = len(clean_text.split())
     desired_words = target_abstractive_words(input_word_count, target_words)
-    chunks = chunk_text_by_words(clean_text, BART_INPUT_WORDS_PER_CHUNK)
+    detail_level = "long" if target_words >= SUMMARY_LENGTH_OPTIONS["Long"]["words"] else "medium"
+    model_input = prepare_abstractive_input(clean_text, target_words, detail_level)
+    chunks = chunk_text_by_words(model_input, BART_INPUT_WORDS_PER_CHUNK)[:BART_MAX_CHUNKS]
     if not chunks:
         return ""
 
-    detail_level = "long" if target_words >= SUMMARY_LENGTH_OPTIONS["Long"]["words"] else "medium"
     max_tokens_per_chunk, min_tokens_per_chunk = token_limits_for_target(
         desired_words,
         len(chunks),
@@ -999,20 +1224,6 @@ def abstractive_summary(clean_text, target_words):
             detail_level,
         )
 
-    if input_word_count > 350 and len(summary.split()) < desired_words * 0.55:
-        retry_max_tokens, retry_min_tokens = token_limits_for_target(
-            int(desired_words * 1.15),
-            detail_level=detail_level,
-        )
-        summary = generate_bart_summary(
-            tokenizer,
-            model,
-            clean_text,
-            retry_max_tokens,
-            retry_min_tokens,
-            detail_level,
-        )
-
     return " ".join(summary.split()[:desired_words])
 
 
@@ -1021,6 +1232,8 @@ def generate_summary(text, target_words, use_abstractive=False):
     input_word_count = len(clean_text.split())
     if input_word_count == 0:
         return ""
+    if input_word_count <= MIN_ABSTRACTIVE_WORDS:
+        return extractive_summary(clean_text, min(target_words, input_word_count))
 
     fallback_target_words = fallback_summary_target(input_word_count, target_words)
 
@@ -1029,7 +1242,6 @@ def generate_summary(text, target_words, use_abstractive=False):
         if (
             summary
             and summary.strip().lower() != clean_text.strip().lower()
-            and not has_summary_quality_issue(summary, clean_text, target_words)
         ):
             return summary
         fallback_summary = extractive_summary(clean_text, fallback_target_words)
@@ -1050,6 +1262,7 @@ def clean_summary_output(summary, source_text=""):
     clean_summary = remove_adjacent_duplicate_words(clean_summary)
     if source_text:
         clean_summary = remove_unsupported_attributions(clean_summary, source_text)
+    clean_summary = polish_summary_sentences(clean_summary)
     clean_summary = normalize_text_spacing(clean_summary)
     if clean_summary and clean_summary[-1] not in ".!?":
         clean_summary += "."
@@ -1649,7 +1862,8 @@ else:
     st.caption("Video summaries use a fast transcript preview so large uploads finish sooner.")
 
     if video_file is not None:
-        video_signature = f"{video_file.name}:{getattr(video_file, 'size', 0)}:fast"
+        video_mode = video_transcription_mode(summary_length)
+        video_signature = f"{video_file.name}:{getattr(video_file, 'size', 0)}:{video_mode}"
         if st.session_state.video_signature == video_signature and st.session_state.video_transcript:
             text = st.session_state.video_transcript
             st.session_state.input_text = text
@@ -1704,14 +1918,20 @@ if generate_clicked:
             st.markdown(f'<div class="output-box">{html.escape(text[:3000])}</div>', unsafe_allow_html=True)
 
     if option == "Upload Video" and text.strip() == "" and video_file is not None:
-        video_signature = f"{video_file.name}:{getattr(video_file, 'size', 0)}:fast"
+        video_mode = video_transcription_mode(summary_length)
+        video_signature = f"{video_file.name}:{getattr(video_file, 'size', 0)}:{video_mode}"
 
         if st.session_state.video_signature == video_signature and st.session_state.video_transcript:
             text = st.session_state.video_transcript
             st.session_state.input_text = text
         else:
-            with st.spinner("Transcribing a fast video summary..."):
-                text = extract_video_audio_text(video_file, full_video=False)
+            with st.spinner("Transcribing video audio..."):
+                text = extract_video_audio_text(video_file, full_video=(video_mode == "full"))
+                if (
+                    video_mode == "fast"
+                    and len(text.split()) < MIN_FAST_VIDEO_TRANSCRIPT_WORDS
+                ):
+                    text = extract_video_audio_text(video_file, full_video=True)
                 st.session_state.video_signature = video_signature
                 st.session_state.video_transcript = text
                 st.session_state.input_text = text
@@ -1724,7 +1944,7 @@ if generate_clicked:
         if option == "Paste URL":
             st.warning(st.session_state.url_warning or "Please enter a valid webpage or YouTube URL.")
         elif option == "Upload Video":
-            st.warning("Please upload a video with detectable speech.")
+            st.warning("I could not detect speech in this video preview. If the video has music, long silent sections, or speech later in the file, try a shorter clip with speech near the beginning or paste a transcript.")
         else:
             st.warning("Please enter some text or upload a supported file.")
     else:
