@@ -20,11 +20,11 @@ BASIC_VIDEO_SAMPLE_STARTS = (0, 30, 60)
 MIN_YOUTUBE_CAPTION_WORDS = 45
 REPEATED_PHRASE_MAX_WORDS = 12
 REPEATED_PHRASE_MIN_OCCURRENCES = 3
-BART_MODEL_NAME = "sshleifer/distilbart-cnn-6-6"
-BART_INPUT_WORDS_PER_CHUNK = 900
-FAST_ABSTRACTIVE_INPUT_WORDS = 900
-FAST_ABSTRACTIVE_LONG_INPUT_WORDS = 1400
-BART_MAX_CHUNKS = 2
+BART_MODEL_NAME = "facebook/bart-large-cnn"
+BART_INPUT_WORDS_PER_CHUNK = 700
+FAST_ABSTRACTIVE_INPUT_WORDS = 1800
+FAST_ABSTRACTIVE_LONG_INPUT_WORDS = 2800
+BART_MAX_CHUNKS = 4
 BART_COPY_NGRAM_BLOCK = 4
 MIN_ABSTRACTIVE_WORDS = 12
 MIN_FAST_VIDEO_TRANSCRIPT_WORDS = 90
@@ -329,6 +329,22 @@ def extract_youtube_transcript(url):
 
     try:
         transcript_api = load_transcript_api()
+        try:
+            transcript_segments = _fetch_transcript_segments(
+                transcript_api.fetch(
+                    video_id,
+                    languages=["en", "en-US", "en-GB", "en-IN"],
+                )
+            )
+        except Exception:
+            transcript_segments = None
+
+        if transcript_segments:
+            transcript_parts = [_segment_text(segment) for segment in transcript_segments if _segment_text(segment).strip()]
+            transcript_text = clean_conversational_transcript(" ".join(transcript_parts))
+            if transcript_text:
+                return transcript_text, ""
+
         transcript_list = transcript_api.list(video_id)
         preferred_languages = ("en", "en-US", "en-GB", "en-IN")
         available_transcripts = list(transcript_list)
@@ -379,8 +395,11 @@ def extract_youtube_transcript(url):
             return "", "No transcript was available for that YouTube video. Try a video with captions enabled."
 
         transcript_segments = _fetch_transcript_segments(transcript)
-    except Exception:
-        return "", "No transcript was available for that YouTube video. Try a video with captions enabled."
+    except Exception as error:
+        error_name = error.__class__.__name__
+        if error_name in {"RequestBlocked", "IpBlocked"}:
+            return "", "YouTube blocked transcript access from this server. This can happen on Streamlit Cloud. Try another video, run locally, or paste the transcript text."
+        return "", f"I could not fetch the YouTube transcript ({error_name}). Try a video with captions enabled or paste the transcript text."
 
     transcript_parts = [_segment_text(segment) for segment in transcript_segments if _segment_text(segment).strip()]
     transcript_text = clean_conversational_transcript(" ".join(transcript_parts))
@@ -691,6 +710,68 @@ def normalize_text_spacing(text):
     return clean_text.strip()
 
 
+def normalize_bad_grammar(text):
+    """Fix common grammar issues in poorly-written text without altering valid content."""
+    clean_text = text
+
+    # Fix repeated conjunctions: "and and", "or or", "but but"
+    clean_text = re.sub(r"\b(and|or|but)\s+\1\b", r"\1", clean_text, flags=re.IGNORECASE)
+
+    # Fix repeated determiners: "the the", "a a", "an an"
+    clean_text = re.sub(r"\b(the|a|an)\s+\1\b", r"\1", clean_text, flags=re.IGNORECASE)
+
+    # Fix "to to", "is is", "are are", "was was", "in in", "on on", "of of", "for for"
+    clean_text = re.sub(r"\b(to|is|are|was|were|has|have|in|on|of|for|with|at|by)\s+\1\b", r"\1", clean_text, flags=re.IGNORECASE)
+
+    # Fix trailing incomplete clauses like "and to avoid" or "and make sure" at sentence end
+    clean_text = re.sub(r"\s+(and|or|but)\s+(to|the|a|an)\s*$", r" \1 \2", clean_text)
+
+    # Remove dangling "and/or/but" at end of text (incomplete fragments)
+    clean_text = re.sub(r"\s+(and|or|but)\s*$", "", clean_text, flags=re.IGNORECASE)
+    clean_text = re.sub(r"\s+(and|or|but)\s+(to|the|a|an|and|or|but)\s*$", "", clean_text, flags=re.IGNORECASE)
+
+    # Fix "avoid X and avoid Y" pattern -> "avoid X and Y" (single level)
+    clean_text = re.sub(
+        r"\b(avoid|prevent|reduce|use|choose|make|follow|stop|minimize)\s+(.{3,30}?)\s+and\s+\1\s+",
+        r"\1 \2 and ",
+        clean_text,
+        flags=re.IGNORECASE,
+    )
+
+    # Fix chained repetition like "reduce plastic use and choose to avoid plastic use"
+    # Captures when same concept is repeated with different verbs
+    clean_text = re.sub(
+        r"\b(avoid|prevent|reduce|use|choose|make|follow|stop|minimize)\s+(.{3,40}?)\s+(?:and|or)\s+\1\b",
+        r"\1 \2",
+        clean_text,
+        flags=re.IGNORECASE,
+    )
+
+    # Fix "waste and waste" type repetition (same noun/verb joined by "and")
+    clean_text = re.sub(
+        r"\b([a-z]{3,})\s+and\s+\1\b",
+        r"\1",
+        clean_text,
+        flags=re.IGNORECASE,
+    )
+
+    # Fix "the waste and waste" (determiner + same word + and + same word)
+    clean_text = re.sub(
+        r"\b(the|a|an)\s+([a-z]{3,})\s+and\s+\2\b",
+        r"\1 \2",
+        clean_text,
+        flags=re.IGNORECASE,
+    )
+
+    # Fix "reduce plastic use, and choose" -> "reduce plastic use and choose"
+    clean_text = re.sub(r"\b(and|or|but)\s*,", r"\1", clean_text)
+
+    # Remove leading conjunctions at start of text
+    clean_text = re.sub(r"^(And|But|Or|So)\s+", "", clean_text, flags=re.IGNORECASE)
+
+    return normalize_text_spacing(clean_text)
+
+
 def remove_adjacent_duplicate_words(text):
     words = text.split()
     filtered_words = []
@@ -765,17 +846,157 @@ def has_repeated_word_noise(words):
     if len(words) < 6:
         return False
 
+    clean_words = [
+        re.sub(r"[^a-z0-9]+", "", word.lower())
+        for word in words
+    ]
+    clean_words = [word for word in clean_words if word]
+    if len(clean_words) < 6:
+        return False
+
     repeated_adjacent = sum(
         1
-        for index in range(1, len(words))
-        if words[index] == words[index - 1]
+        for index in range(1, len(clean_words))
+        if clean_words[index] == clean_words[index - 1]
     )
     if repeated_adjacent >= 3:
         return True
 
-    unique_ratio = len(set(words)) / len(words)
-    most_common_count = max(words.count(word) for word in set(words))
-    return unique_ratio < 0.45 and most_common_count >= 3
+    for phrase_length in range(2, 5):
+        phrase_counts = {}
+        for index in range(0, len(clean_words) - phrase_length + 1):
+            phrase = tuple(clean_words[index:index + phrase_length])
+            phrase_counts[phrase] = phrase_counts.get(phrase, 0) + 1
+        if any(count >= 3 for count in phrase_counts.values()):
+            return True
+
+    unique_ratio = len(set(clean_words)) / len(clean_words)
+    most_common_count = max(clean_words.count(word) for word in set(clean_words))
+    common_repeated_noise = any(
+        clean_words.count(word) >= 3
+        and clean_words.count(word) / len(clean_words) >= 0.12
+        for word in {
+            "and",
+            "a",
+            "an",
+            "for",
+            "from",
+            "in",
+            "of",
+            "or",
+            "their",
+            "the",
+            "to",
+            "with",
+        }
+    )
+    return (unique_ratio < 0.50 and most_common_count >= 3) or common_repeated_noise
+
+
+def has_finite_verb(words):
+    finite_verbs = {
+        "am",
+        "are",
+        "be",
+        "became",
+        "become",
+        "becomes",
+        "been",
+        "being",
+        "can",
+        "could",
+        "did",
+        "do",
+        "does",
+        "had",
+        "has",
+        "have",
+        "is",
+        "may",
+        "might",
+        "must",
+        "shall",
+        "should",
+        "was",
+        "were",
+        "will",
+        "would",
+    }
+    if any(word in finite_verbs for word in words):
+        return True
+    return any(
+        re.search(r"(?:ed|ates?|ifies?|ises?|izes?)$", word)
+        and len(word) > 4
+        for word in words
+    )
+
+
+def is_fragmented_source_sentence(text):
+    normalized = normalize_text_spacing(text)
+    if not normalized:
+        return True
+
+    words = re.findall(r"[a-z][a-z'-]*", normalized.lower())
+    if not words:
+        return True
+
+    lower_text = normalized.lower()
+    function_words = {
+        "a",
+        "an",
+        "and",
+        "for",
+        "from",
+        "in",
+        "of",
+        "or",
+        "the",
+        "their",
+        "to",
+        "with",
+    }
+    if len(words) < 5 and not normalized.endswith((".", "!", "?")):
+        return True
+    if re.match(r"^(and|but|or|so|to)\b", lower_text):
+        return True
+    if re.match(r"^(is|are|was|were|has|have|had)\s+(also\s+)?\w+ing\b", lower_text):
+        return True
+    if len(words) <= 9 and re.match(r"^(?:the\s+)?[a-z][a-z'-]*\s+to\s+\w+", lower_text):
+        return True
+    if re.search(r"\b(?:expected|going|supposed)\s+to\s+be\s+(?:more|better|good|important|useful)[.!?]?$", lower_text):
+        return True
+    function_word_ratio = sum(1 for word in words if word in function_words) / len(words)
+    if len(words) <= 9 and not has_finite_verb(words) and function_word_ratio > 0.35:
+        return True
+    if words[-1] in {
+        "a",
+        "an",
+        "and",
+        "for",
+        "from",
+        "in",
+        "of",
+        "or",
+        "own",
+        "the",
+        "their",
+        "to",
+        "with",
+    }:
+        return True
+    if has_repeated_word_noise(words):
+        return True
+
+    if len(words) >= 8:
+        if function_word_ratio > 0.48 and not has_finite_verb(words):
+            return True
+
+    quote_count = normalized.count("'") + normalized.count('"')
+    punctuation_count = len(re.findall(r"[^\w\s]", normalized))
+    if quote_count >= 4 and punctuation_count / max(1, len(normalized)) > 0.12:
+        return True
+
+    return False
 
 
 def is_low_quality_sentence(text):
@@ -788,10 +1009,19 @@ def is_low_quality_sentence(text):
     if not words:
         return True
 
+    # If the sentence is long enough with meaningful words, be more lenient
+    if len(words) >= 12:
+        meaningful_words = [w for w in words if w not in PROFANITY_WORDS and len(w) > 2]
+        if len(meaningful_words) >= 8:
+            # Long meaningful sentences should almost never be filtered
+            if has_repeated_word_noise(words):
+                pass  # Still let repeated word noise filter below decide
+            else:
+                return False  # Automatically pass quality check
+
     url_count = len(re.findall(r"(?:https?://|www\.|[a-z0-9.-]+\.(?:com|org|net|in|edu|gov)\b)", normalized))
     profanity_count = sum(1 for word in words if word in PROFANITY_WORDS)
     navigation_count = sum(1 for word in words if word in NAVIGATION_NOISE_WORDS)
-    alphabetic_chars = sum(1 for char in normalized if char.isalpha())
 
     if profanity_count >= 2 and len(words) < 14:
         return True
@@ -801,13 +1031,11 @@ def is_low_quality_sentence(text):
         return True
     if url_count >= 2:
         return True
-    if navigation_count >= 3 and navigation_count / len(words) > 0.25:
+    if navigation_count >= 4 and navigation_count / len(words) > 0.30:
         return True
     if normalized.startswith(("back ", "share ", "subscribe ", "advertisement", "read more", "sign in", "log in")):
         return True
     if has_repeated_word_noise(words):
-        return True
-    if len(words) >= 8 and alphabetic_chars / max(1, len(normalized)) < 0.55:
         return True
 
     return False
@@ -941,6 +1169,52 @@ def remove_unsupported_attributions(summary, source_text):
     return " ".join(filtered_sentences) if filtered_sentences else summary
 
 
+def has_unsupported_named_term(sentence, source_text):
+    if not source_text:
+        return False
+
+    source_lower = source_text.lower()
+    tokens = re.findall(r"\b[A-Z][A-Za-z'-]*\b|\b[A-Z]{2,}\b", sentence)
+    for index, token in enumerate(tokens):
+        token_key = token.lower().strip("'")
+        if not token_key:
+            continue
+        if index == 0 and not token.isupper():
+            continue
+        if token_key not in source_lower:
+            return True
+
+    quoted_terms = re.findall(r"['\"]([^'\"]{3,})['\"]", sentence)
+    for term in quoted_terms:
+        if term.lower() not in source_lower:
+            return True
+
+    return False
+
+
+def remove_unsupported_summary_sentences(summary, source_text):
+    if not source_text:
+        return summary
+
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", summary)
+        if sentence.strip()
+    ]
+    if not sentences:
+        return summary
+
+    filtered_sentences = []
+    for sentence in sentences:
+        if is_fragmented_source_sentence(sentence):
+            continue
+        if has_unsupported_named_term(sentence, source_text):
+            continue
+        filtered_sentences.append(sentence)
+
+    return " ".join(filtered_sentences) if filtered_sentences else summary
+
+
 def fix_common_summary_join_errors(text):
     replacements = {
         "suggestappropriate": "suggest appropriate",
@@ -985,7 +1259,7 @@ def polish_summary_sentences(text):
         sentence = fix_common_summary_join_errors(sentence).strip(" ,;:")
         if len(sentence.split()) < 5:
             continue
-        if not re.search(r"\b(is|are|was|were|has|have|can|will|should|provides?|improves?|creates?|supports?|helps?|uses?|includes?|transforms?|analyzes?|identifies?|enhances?|presents?|expects?|reshapes?)\b", sentence, flags=re.IGNORECASE):
+        if is_low_quality_sentence(sentence):
             continue
         sentence = sentence[0].upper() + sentence[1:]
         if sentence[-1] not in ".!?":
@@ -1012,6 +1286,38 @@ def clean_transcript_text(text):
             flags=re.IGNORECASE,
         )
     return normalize_text_spacing(clean_text)
+
+
+def clean_source_for_summary(text):
+    clean_text = clean_transcript_text(text)
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", clean_text)
+        if sentence.strip()
+    ]
+    if len(sentences) <= 1:
+        return clean_text
+
+    filtered_sentences = []
+    for sentence in sentences:
+        cleaned_sentence = normalize_text_spacing(remove_adjacent_duplicate_words(sentence))
+        if (
+            cleaned_sentence
+            and not is_boilerplate_text(cleaned_sentence)
+            and not is_fragmented_source_sentence(cleaned_sentence)
+            and not is_low_quality_sentence(cleaned_sentence)
+        ):
+            filtered_sentences.append(cleaned_sentence)
+
+    filtered_text = normalize_text_spacing(" ".join(filtered_sentences))
+    filtered_word_count = len(filtered_text.split())
+    original_word_count = len(clean_text.split())
+    if filtered_word_count >= 25 or (
+        filtered_word_count >= 8
+        and filtered_word_count >= int(original_word_count * 0.25)
+    ):
+        return filtered_text
+    return clean_text
 
 
 def clean_conversational_transcript(text):
@@ -1086,6 +1392,30 @@ def chunk_text_by_words(text, words_per_chunk):
     ]
 
 
+def trim_to_sentence_boundary(text, target_words):
+    words = text.split()
+    if len(words) <= target_words:
+        return text
+
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", text)
+        if sentence.strip()
+    ]
+    selected_sentences = []
+    selected_word_count = 0
+    for sentence in sentences:
+        sentence_word_count = len(sentence.split())
+        if selected_sentences and selected_word_count + sentence_word_count > target_words:
+            break
+        selected_sentences.append(sentence)
+        selected_word_count += sentence_word_count
+
+    if selected_sentences:
+        return " ".join(selected_sentences)
+    return " ".join(words[:target_words]).rstrip(" ,;:") + "."
+
+
 def prepare_abstractive_input(clean_text, target_words, detail_level):
     words = clean_text.split()
     if len(words) <= FAST_ABSTRACTIVE_INPUT_WORDS:
@@ -1108,17 +1438,27 @@ def has_summary_quality_issue(summary, source_text, target_words):
     if not summary_words:
         return True
     source_word_count = len(source_text.split())
-    if source_word_count > 250 and target_words < source_word_count and len(summary_words) < min(70, target_words * 0.45):
+    # Only flag quality issues for clearly broken outputs, not for well-formed BART rephrasings
+    # that may be shorter than expected because they fixed grammar/redundancy
+    if source_word_count > 500 and target_words < source_word_count and len(summary_words) < min(40, target_words * 0.25):
         return True
-    if has_repeated_word_noise([re.sub(r"[^a-z0-9]+", "", word.lower()) for word in summary_words if word.strip()]):
-        return True
+    # Only apply repeated word noise check if the summary is extremely short (< target ) and clearly garbled
+    if len(summary_words) < max(20, target_words * 0.5):
+        if has_repeated_word_noise([re.sub(r"[^a-z0-9]+", "", word.lower()) for word in summary_words if word.strip()]):
+            return True
 
-    sentences = [
-        sentence.strip().lower()
+    summary_sentences = [
+        sentence.strip()
         for sentence in re.split(r"(?<=[.!?])\s+", summary)
         if sentence.strip()
     ]
-    if len(sentences) != len(set(sentences)):
+    sentences = [
+        sentence.strip().lower()
+        for sentence in summary_sentences
+    ]
+    if len(sentences) >= 2 and len(sentences) != len(set(sentences)):
+        return True
+    if any(has_unsupported_named_term(sentence, source_text) for sentence in summary_sentences):
         return True
 
     return False
@@ -1166,7 +1506,7 @@ def generate_bart_summary(tokenizer, model, text, max_tokens, min_tokens, detail
             attention_mask=inputs["attention_mask"],
             max_length=max_tokens,
             min_length=min_tokens,
-            num_beams=1,
+            num_beams=4,
             do_sample=False,
             no_repeat_ngram_size=3,
             encoder_no_repeat_ngram_size=BART_COPY_NGRAM_BLOCK,
@@ -1224,11 +1564,21 @@ def abstractive_summary(clean_text, target_words):
             detail_level,
         )
 
-    return " ".join(summary.split()[:desired_words])
+    return trim_to_sentence_boundary(summary, desired_words)
+
+
+def is_usable_abstractive_summary(summary, source_text, target_words):
+    if not summary:
+        return False
+    if summary.strip().lower() == source_text.strip().lower():
+        return False
+    return not has_summary_quality_issue(summary, source_text, target_words)
 
 
 def generate_summary(text, target_words, use_abstractive=False):
-    clean_text = clean_transcript_text(text)
+    # First, run grammar normalization to fix common issues before summarization
+    text = normalize_bad_grammar(text)
+    clean_text = clean_source_for_summary(text)
     input_word_count = len(clean_text.split())
     if input_word_count == 0:
         return ""
@@ -1239,11 +1589,13 @@ def generate_summary(text, target_words, use_abstractive=False):
 
     if use_abstractive:
         summary = abstractive_summary(clean_text, target_words)
-        if (
-            summary
-            and summary.strip().lower() != clean_text.strip().lower()
-        ):
+        if is_usable_abstractive_summary(summary, clean_text, target_words):
             return summary
+        # Retry with less aggressive cleaning (skip remove_repeated_phrases which can fragment poor grammar)
+        relaxed_text = normalize_text_spacing(text)
+        relaxed_summary = abstractive_summary(relaxed_text, target_words)
+        if is_usable_abstractive_summary(relaxed_summary, relaxed_text, target_words):
+            return relaxed_summary
         fallback_summary = extractive_summary(clean_text, fallback_target_words)
         if fallback_summary:
             return fallback_summary
@@ -1262,6 +1614,7 @@ def clean_summary_output(summary, source_text=""):
     clean_summary = remove_adjacent_duplicate_words(clean_summary)
     if source_text:
         clean_summary = remove_unsupported_attributions(clean_summary, source_text)
+        clean_summary = remove_unsupported_summary_sentences(clean_summary, source_text)
     clean_summary = polish_summary_sentences(clean_summary)
     clean_summary = normalize_text_spacing(clean_summary)
     if clean_summary and clean_summary[-1] not in ".!?":
