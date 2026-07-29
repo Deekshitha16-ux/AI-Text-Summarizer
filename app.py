@@ -12,6 +12,10 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 
+URL_FETCH_TIMEOUT_SECONDS = 10
+URL_MAX_HTML_BYTES = 2_000_000
+URL_MAX_TEXT_WORDS = 2000
+ENABLE_YOUTUBE_AUDIO_FALLBACK = os.getenv("ENABLE_YOUTUBE_AUDIO_FALLBACK", "").lower() in {"1", "true", "yes"}
 VIDEO_CHUNK_SECONDS = 30
 VIDEO_BATCH_SIZE = 2
 VIDEO_PREVIEW_SEGMENT_SECONDS = 30
@@ -20,11 +24,17 @@ BASIC_VIDEO_SAMPLE_STARTS = (0, 30, 60)
 MIN_YOUTUBE_CAPTION_WORDS = 45
 REPEATED_PHRASE_MAX_WORDS = 12
 REPEATED_PHRASE_MIN_OCCURRENCES = 3
-BART_MODEL_NAME = "facebook/bart-large-cnn"
-BART_INPUT_WORDS_PER_CHUNK = 700
-FAST_ABSTRACTIVE_INPUT_WORDS = 1800
-FAST_ABSTRACTIVE_LONG_INPUT_WORDS = 2800
-BART_MAX_CHUNKS = 4
+BART_MODEL_NAME = "sshleifer/distilbart-cnn-12-6"
+BART_INPUT_WORDS_PER_CHUNK = 1000
+FAST_ABSTRACTIVE_INPUT_WORDS = 1000
+FAST_ABSTRACTIVE_LONG_INPUT_WORDS = 2000
+BART_MAX_CHUNKS = 2
+BART_TOKENIZER_MAX_LENGTH = 768
+BART_NUM_BEAMS = 2
+BART_MAX_GENERATION_TOKENS = 100
+BART_LONG_MAX_GENERATION_TOKENS = 120
+BART_MIN_GENERATION_TOKENS = 30
+BART_RELAXED_RETRY_MAX_WORDS = 600
 BART_COPY_NGRAM_BLOCK = 4
 MIN_ABSTRACTIVE_WORDS = 12
 MIN_FAST_VIDEO_TRANSCRIPT_WORDS = 90
@@ -158,12 +168,13 @@ NAVIGATION_NOISE_WORDS = {
 @st.cache_resource
 def load_model():
     import torch
-    from transformers import BartForConditionalGeneration, BartTokenizer
+    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
     from transformers.utils import logging as transformers_logging
 
     transformers_logging.disable_progress_bar()
-    tokenizer = BartTokenizer.from_pretrained(BART_MODEL_NAME)
-    model = BartForConditionalGeneration.from_pretrained(BART_MODEL_NAME)
+    tokenizer = AutoTokenizer.from_pretrained(BART_MODEL_NAME)
+    model = AutoModelForSeq2SeqLM.from_pretrained(BART_MODEL_NAME)
+    model.generation_config.forced_bos_token_id = 0
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
     model.eval()
@@ -182,6 +193,7 @@ def load_asr_model():
         "automatic-speech-recognition",
         model="openai/whisper-tiny.en",
         device=device,
+        ignore_warning=True,
     )
 
 
@@ -254,27 +266,33 @@ def extract_url_text(url):
     if is_youtube_url(url):
         caption_text, caption_error = extract_youtube_transcript(url)
         if len(caption_text.split()) >= MIN_YOUTUBE_CAPTION_WORDS:
-            return caption_text, ""
+            return limit_url_text(caption_text), ""
 
-        audio_text = extract_youtube_audio_text(url)
-        if audio_text:
-            return audio_text, ""
+        if ENABLE_YOUTUBE_AUDIO_FALLBACK:
+            audio_text = extract_youtube_audio_text(url)
+            if audio_text:
+                return limit_url_text(audio_text), ""
         if caption_text:
-            return caption_text, ""
-        return "", caption_error or "I could not read captions or transcribe audio from this YouTube video."
+            return limit_url_text(caption_text), ""
+        return "", caption_error or "I could not read captions from this YouTube video. Try a video with captions enabled or paste the transcript."
 
     request = Request(
         url,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; AITextSummarizer/1.0)"}
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
     )
 
     try:
-        with urlopen(request, timeout=20) as response:
+        with urlopen(request, timeout=URL_FETCH_TIMEOUT_SECONDS) as response:
             content_type = response.headers.get_content_type()
             if content_type not in {"text/html", "application/xhtml+xml"}:
                 return "", "That URL does not look like a readable webpage. Try a news article or blog page."
 
-            html_content = response.read().decode(response.headers.get_content_charset() or "utf-8", errors="ignore")
+            html_content = response.read(URL_MAX_HTML_BYTES).decode(response.headers.get_content_charset() or "utf-8", errors="ignore")
     except (URLError, HTTPError, ValueError):
         return "", "I could not open that webpage. It may be private, blocked, or unavailable."
 
@@ -284,7 +302,14 @@ def extract_url_text(url):
     text = " ".join(extracted_text.split())
     if not text:
         return "", "I opened the webpage, but no readable article text was found."
-    return text, ""
+    return limit_url_text(text), ""
+
+
+def limit_url_text(text):
+    words = text.split()
+    if len(words) <= URL_MAX_TEXT_WORDS:
+        return text
+    return " ".join(words[:URL_MAX_TEXT_WORDS])
 
 
 def is_youtube_url(url):
@@ -409,7 +434,6 @@ def extract_youtube_transcript(url):
 
 
 def extract_youtube_audio_text(url):
-    from imageio_ffmpeg import get_ffmpeg_exe
     from yt_dlp import YoutubeDL
 
     temp_dir = tempfile.mkdtemp()
@@ -422,31 +446,27 @@ def extract_youtube_audio_text(url):
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,
-            "ffmpeg_location": os.path.dirname(get_ffmpeg_exe()),
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "wav",
-                    "preferredquality": "64",
-                }
-            ],
         }
         with YoutubeDL(ydl_options) as ydl:
             ydl.download([url])
 
-        wav_files = [
+        downloaded_files = [
             os.path.join(temp_dir, filename)
             for filename in os.listdir(temp_dir)
-            if filename.lower().endswith(".wav")
+            if os.path.isfile(os.path.join(temp_dir, filename))
         ]
-        if not wav_files:
+        if not downloaded_files:
             return ""
 
-        audio_path = wav_files[0]
+        audio_path = extract_video_audio(downloaded_files[0])
+        if not audio_path:
+            return ""
         return clean_conversational_transcript(transcribe_audio_file(audio_path, load_asr_model()))
     except Exception:
         return ""
     finally:
+        if audio_path and os.path.exists(audio_path):
+            os.remove(audio_path)
         if os.path.isdir(temp_dir):
             shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -485,6 +505,7 @@ def transcribe_audio_file(audio_path, asr_model):
         chunk_length_s=VIDEO_CHUNK_SECONDS,
         batch_size=VIDEO_BATCH_SIZE,
         return_timestamps=False,
+        generate_kwargs={"task": "transcribe", "language": "english"},
     )
     if isinstance(transcript, dict):
         return transcript.get("text", "").strip()
@@ -1479,13 +1500,13 @@ def token_limits_for_target(target_words, chunk_count=1, detail_level="medium"):
 
     per_chunk_words = max(60, per_chunk_words)
     if detail_level == "long":
-        max_tokens = max(170, min(520, int(per_chunk_words * 2.25)))
-        min_tokens = max(80, min(360, int(per_chunk_words * 1.25)))
+        max_tokens = max(80, min(BART_LONG_MAX_GENERATION_TOKENS, int(per_chunk_words * 1.1)))
+        min_tokens = max(BART_MIN_GENERATION_TOKENS, min(60, int(per_chunk_words * 0.45)))
     else:
-        max_tokens = max(120, min(420, int(per_chunk_words * 1.8)))
-        min_tokens = max(45, min(240, int(per_chunk_words * 0.9)))
+        max_tokens = max(60, min(BART_MAX_GENERATION_TOKENS, int(per_chunk_words * 1.0)))
+        min_tokens = max(BART_MIN_GENERATION_TOKENS, min(50, int(per_chunk_words * 0.4)))
     if min_tokens >= max_tokens:
-        min_tokens = max(30, max_tokens - 20)
+        min_tokens = max(10, max_tokens - 20)
     return max_tokens, min_tokens
 
 
@@ -1494,7 +1515,7 @@ def generate_bart_summary(tokenizer, model, text, max_tokens, min_tokens, detail
 
     inputs = tokenizer(
         text,
-        max_length=1024,
+        max_length=BART_TOKENIZER_MAX_LENGTH,
         truncation=True,
         return_tensors="pt",
     )
@@ -1506,7 +1527,7 @@ def generate_bart_summary(tokenizer, model, text, max_tokens, min_tokens, detail
             attention_mask=inputs["attention_mask"],
             max_length=max_tokens,
             min_length=min_tokens,
-            num_beams=4,
+            num_beams=BART_NUM_BEAMS,
             do_sample=False,
             no_repeat_ngram_size=3,
             encoder_no_repeat_ngram_size=BART_COPY_NGRAM_BLOCK,
@@ -1548,22 +1569,6 @@ def abstractive_summary(clean_text, target_words):
     if not summary:
         return ""
 
-    # Short and medium summaries should be tightly condensed. Long summaries should
-    # keep coverage from each source chunk and only be compressed when clearly too long.
-    should_compress_merged_summary = (
-        detail_level != "long" and len(chunks) > 1
-    ) or len(summary.split()) > desired_words * 1.35
-    if should_compress_merged_summary:
-        final_max_tokens, final_min_tokens = token_limits_for_target(desired_words, detail_level=detail_level)
-        summary = generate_bart_summary(
-            tokenizer,
-            model,
-            summary,
-            final_max_tokens,
-            final_min_tokens,
-            detail_level,
-        )
-
     return trim_to_sentence_boundary(summary, desired_words)
 
 
@@ -1592,10 +1597,11 @@ def generate_summary(text, target_words, use_abstractive=False):
         if is_usable_abstractive_summary(summary, clean_text, target_words):
             return summary
         # Retry with less aggressive cleaning (skip remove_repeated_phrases which can fragment poor grammar)
-        relaxed_text = normalize_text_spacing(text)
-        relaxed_summary = abstractive_summary(relaxed_text, target_words)
-        if is_usable_abstractive_summary(relaxed_summary, relaxed_text, target_words):
-            return relaxed_summary
+        if input_word_count <= BART_RELAXED_RETRY_MAX_WORDS:
+            relaxed_text = normalize_text_spacing(text)
+            relaxed_summary = abstractive_summary(relaxed_text, target_words)
+            if is_usable_abstractive_summary(relaxed_summary, relaxed_text, target_words):
+                return relaxed_summary
         fallback_summary = extractive_summary(clean_text, fallback_target_words)
         if fallback_summary:
             return fallback_summary
@@ -1627,6 +1633,9 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# Warm the cached summarization model once per app process so button clicks reuse it.
+load_model()
 
 st.markdown(
     """
@@ -2182,7 +2191,7 @@ elif option == "Paste URL":
     st.session_state.url_input = current_url
 
     if current_url:
-        st.info("Click Generate Summary to fetch this URL and summarize it in one step.")
+        st.info("Click Generate Summary to fetch and summarize this URL. YouTube links work fastest when captions are available.")
 
 elif option == "Upload File":
     st.markdown('<div class="panel-title">Document Upload</div>', unsafe_allow_html=True)
