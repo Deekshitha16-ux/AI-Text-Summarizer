@@ -1,3 +1,5 @@
+# Live Demo 
+https://ai-text-summarizer-vcjwcwappctgxk6mhwc5oqk.streamlit.app/
 # 📝 AI Text Summarizer
 
 An AI-powered Text Summarization application built using **Streamlit**, **Hugging Face Transformers**, and **Python**. The application generates concise and meaningful summaries from multiple input sources, including text, documents, webpages, YouTube videos, and uploaded videos.
