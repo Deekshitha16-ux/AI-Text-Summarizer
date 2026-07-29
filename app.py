@@ -1,5 +1,6 @@
 import streamlit as st
 import html
+import contextlib
 import os
 import re
 import shutil
@@ -15,6 +16,13 @@ from urllib.request import Request, urlopen
 URL_FETCH_TIMEOUT_SECONDS = 10
 URL_MAX_HTML_BYTES = 2_000_000
 URL_MAX_TEXT_WORDS = 2000
+OCR_MIN_ALPHA_RATIO = 0.45
+OCR_MAX_SYMBOL_RATIO = 0.18
+TESSERACT_TESSDATA_DIRS = (
+    os.getenv("TESSDATA_PREFIX", ""),
+    r"C:\Program Files\Tesseract-OCR\tessdata",
+    r"C:\Program Files (x86)\Tesseract-OCR\tessdata",
+)
 ENABLE_YOUTUBE_AUDIO_FALLBACK = os.getenv("ENABLE_YOUTUBE_AUDIO_FALLBACK", "").lower() in {"1", "true", "yes"}
 VIDEO_CHUNK_SECONDS = 30
 VIDEO_BATCH_SIZE = 2
@@ -174,6 +182,7 @@ def load_model():
     transformers_logging.disable_progress_bar()
     tokenizer = AutoTokenizer.from_pretrained(BART_MODEL_NAME)
     model = AutoModelForSeq2SeqLM.from_pretrained(BART_MODEL_NAME)
+    model.config.forced_bos_token_id = 0
     model.generation_config.forced_bos_token_id = 0
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
@@ -203,21 +212,122 @@ def load_transcript_api():
 
     return YouTubeTranscriptApi()
 
+
+def find_tessdata_dir():
+    for tessdata_dir in TESSERACT_TESSDATA_DIRS:
+        if tessdata_dir and os.path.isdir(tessdata_dir):
+            return tessdata_dir
+    return ""
+
+
+def is_noisy_ocr_line(line):
+    clean_line = line.strip()
+    if not clean_line:
+        return True
+
+    letters = len(re.findall(r"[A-Za-z]", clean_line))
+    words = re.findall(r"[A-Za-z][A-Za-z'-]{1,}", clean_line)
+    symbol_count = len(re.findall(r"[^A-Za-z0-9\s.,;:!?()/%+-]", clean_line))
+    alpha_ratio = letters / max(1, len(clean_line))
+    symbol_ratio = symbol_count / max(1, len(clean_line))
+
+    if len(clean_line) <= 3:
+        return True
+    if symbol_ratio > OCR_MAX_SYMBOL_RATIO:
+        return True
+    if alpha_ratio < OCR_MIN_ALPHA_RATIO and len(words) < 4:
+        return True
+    if len(words) <= 1 and len(clean_line) < 18:
+        return True
+    if re.fullmatch(r"[\W\d_]+", clean_line):
+        return True
+    return False
+
+
+def clean_ocr_text(text):
+    clean_text = text.replace("|", " ")
+    clean_text = re.sub(r"[_~`^*<>={}\[\]\\]+", " ", clean_text)
+    clean_text = re.sub(r"\b[\w]*[@#$][\w@#$-]*\b", " ", clean_text)
+    clean_text = re.sub(r"\b[a-zA-Z]\b(?=\s+[A-Z][a-z])", " ", clean_text)
+
+    raw_lines = [
+        normalize_text_spacing(line.strip(" -*•·\t"))
+        for line in re.split(r"[\r\n]+", clean_text)
+    ]
+    useful_lines = []
+    for line in raw_lines:
+        line = re.sub(r"^(?:[a-zA-Z]\s+){1,3}(?=[A-Z][a-z])", "", line).strip()
+        if not is_noisy_ocr_line(line):
+            useful_lines.append(line)
+
+    if not useful_lines:
+        return ""
+
+    paragraphs = []
+    current = ""
+    for line in useful_lines:
+        if current and (
+            current.endswith((".", "!", "?"))
+            or re.match(r"^[A-Z][A-Za-z ]{2,35}:?$", line)
+        ):
+            paragraphs.append(current.strip())
+            current = line
+        else:
+            current = f"{current} {line}".strip()
+
+        if len(current.split()) >= 28:
+            paragraphs.append(current.strip())
+            current = ""
+
+    if current:
+        paragraphs.append(current.strip())
+
+    cleaned_paragraphs = []
+    for paragraph in paragraphs:
+        paragraph = normalize_text_spacing(paragraph)
+        if len(re.findall(r"[A-Za-z][A-Za-z'-]{1,}", paragraph)) < 3:
+            continue
+        if paragraph[-1] not in ".!?":
+            paragraph += "."
+        cleaned_paragraphs.append(paragraph)
+
+    return "\n\n".join(cleaned_paragraphs)
+
+
 def extract_pdf(file):
     import fitz
 
-    text = ""
-    pdf = fitz.open(stream=file.read(), filetype="pdf")
+    file.seek(0)
+    pdf_bytes = file.read()
+    text_parts = []
 
-    for page in pdf:
-        text += page.get_text()
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as pdf:
+        for page in pdf:
+            page_text = page.get_text("text").strip()
+            if page_text:
+                text_parts.append(page_text)
 
-    return text
+        if text_parts:
+            return "\n\n".join(text_parts)
+
+        tessdata_dir = find_tessdata_dir()
+        if not tessdata_dir:
+            return ""
+
+        for page in pdf:
+            with open(os.devnull, "w", encoding="utf-8") as devnull, contextlib.redirect_stderr(devnull):
+                textpage = page.get_textpage_ocr(language="eng", dpi=200, full=True, tessdata=tessdata_dir)
+            page_text = page.get_text("text", textpage=textpage).strip()
+            if page_text:
+                text_parts.append(page_text)
+
+    return clean_ocr_text("\n\n".join(text_parts))
 
 
 def extract_docx(file):
     from docx import Document
 
+    file.seek(0)
     doc = Document(file)
 
     text = ""
@@ -229,7 +339,8 @@ def extract_docx(file):
 
 
 def extract_txt(file):
-    return file.read().decode("utf-8")
+    file.seek(0)
+    return file.read().decode("utf-8", errors="replace")
 
 
 class _WebTextExtractor(HTMLParser):
@@ -1310,7 +1421,8 @@ def clean_transcript_text(text):
 
 
 def clean_source_for_summary(text):
-    clean_text = clean_transcript_text(text)
+    ocr_clean_text = clean_ocr_text(text)
+    clean_text = clean_transcript_text(ocr_clean_text if ocr_clean_text else text)
     sentences = [
         sentence.strip()
         for sentence in re.split(r"(?<=[.!?])\s+", clean_text)
@@ -1458,6 +1570,18 @@ def has_summary_quality_issue(summary, source_text, target_words):
     summary_words = summary.split()
     if not summary_words:
         return True
+    summary_text = summary.strip()
+    letter_count = len(re.findall(r"[A-Za-z]", summary_text))
+    symbol_count = len(re.findall(r"[^A-Za-z0-9\s.,;:!?()/%+-]", summary_text))
+    single_char_words = len(re.findall(r"\b[A-Za-z]\b", summary_text))
+    if letter_count / max(1, len(summary_text)) < 0.50:
+        return True
+    if symbol_count / max(1, len(summary_text)) > 0.08:
+        return True
+    if single_char_words >= 4 and single_char_words / max(1, len(summary_words)) > 0.08:
+        return True
+    if re.search(r"[$@*_]{2,}|(?:[-_]{3,})|\\[a-zA-Z]", summary_text):
+        return True
     source_word_count = len(source_text.split())
     # Only flag quality issues for clearly broken outputs, not for well-formed BART rephrasings
     # that may be shorter than expected because they fixed grammar/redundancy
@@ -1521,19 +1645,32 @@ def generate_bart_summary(tokenizer, model, text, max_tokens, min_tokens, detail
     )
     device = next(model.parameters()).device
     inputs = {key: value.to(device) for key, value in inputs.items()}
+    generation_args = {
+        "attention_mask": inputs["attention_mask"],
+        "max_length": max_tokens,
+        "min_length": min_tokens,
+        "num_beams": BART_NUM_BEAMS,
+        "do_sample": False,
+        "forced_bos_token_id": 0,
+        "no_repeat_ngram_size": 3,
+        "encoder_no_repeat_ngram_size": BART_COPY_NGRAM_BLOCK,
+        "length_penalty": 1.25 if detail_level == "long" else 1.0,
+        "early_stopping": True,
+    }
+    retry_generation_args = {
+        "attention_mask": inputs["attention_mask"],
+        "max_length": max_tokens,
+        "min_length": min_tokens,
+        "num_beams": 1,
+        "do_sample": False,
+        "forced_bos_token_id": 0,
+    }
+
     with torch.inference_mode():
-        summary_ids = model.generate(
-            inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-            max_length=max_tokens,
-            min_length=min_tokens,
-            num_beams=BART_NUM_BEAMS,
-            do_sample=False,
-            no_repeat_ngram_size=3,
-            encoder_no_repeat_ngram_size=BART_COPY_NGRAM_BLOCK,
-            length_penalty=1.25 if detail_level == "long" else 1.0,
-            early_stopping=True,
-        )
+        try:
+            summary_ids = model.generate(inputs["input_ids"], **generation_args)
+        except ValueError:
+            summary_ids = model.generate(inputs["input_ids"], **retry_generation_args)
     return tokenizer.decode(summary_ids[0], skip_special_tokens=True).strip()
 
 
@@ -1593,13 +1730,19 @@ def generate_summary(text, target_words, use_abstractive=False):
     fallback_target_words = fallback_summary_target(input_word_count, target_words)
 
     if use_abstractive:
-        summary = abstractive_summary(clean_text, target_words)
+        try:
+            summary = abstractive_summary(clean_text, target_words)
+        except Exception:
+            summary = ""
         if is_usable_abstractive_summary(summary, clean_text, target_words):
             return summary
         # Retry with less aggressive cleaning (skip remove_repeated_phrases which can fragment poor grammar)
         if input_word_count <= BART_RELAXED_RETRY_MAX_WORDS:
             relaxed_text = normalize_text_spacing(text)
-            relaxed_summary = abstractive_summary(relaxed_text, target_words)
+            try:
+                relaxed_summary = abstractive_summary(relaxed_text, target_words)
+            except Exception:
+                relaxed_summary = ""
             if is_usable_abstractive_summary(relaxed_summary, relaxed_text, target_words):
                 return relaxed_summary
         fallback_summary = extractive_summary(clean_text, fallback_target_words)
@@ -2141,9 +2284,14 @@ option = st.radio(
 st.markdown('</div>', unsafe_allow_html=True)
 
 text = ""
+uploaded_file = None
 video_file = None
 if "input_text" not in st.session_state:
     st.session_state.input_text = ""
+if "document_signature" not in st.session_state:
+    st.session_state.document_signature = ""
+if "document_text" not in st.session_state:
+    st.session_state.document_text = ""
 if "url_input" not in st.session_state:
     st.session_state.url_input = ""
 if "url_warning" not in st.session_state:
@@ -2158,6 +2306,8 @@ if st.session_state.get("active_option") != option:
     st.session_state.input_text = ""
     st.session_state.url_warning = ""
     st.session_state.fetched_url = ""
+    st.session_state.document_signature = ""
+    st.session_state.document_text = ""
     st.session_state.video_signature = ""
     st.session_state.video_transcript = ""
     st.session_state.active_option = option
@@ -2202,17 +2352,15 @@ elif option == "Upload File":
     )
 
     if uploaded_file is not None:
-        if uploaded_file.name.endswith(".pdf"):
-            text = extract_pdf(uploaded_file)
-        elif uploaded_file.name.endswith(".docx"):
-            text = extract_docx(uploaded_file)
-        elif uploaded_file.name.endswith(".txt"):
-            text = extract_txt(uploaded_file)
-
-        st.session_state.input_text = text
-
-        st.markdown('<div class="panel-title" style="margin-top:1rem;">Extracted Text</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="output-box">{html.escape(text[:3000])}</div>', unsafe_allow_html=True)
+        document_signature = f"{uploaded_file.name}:{getattr(uploaded_file, 'size', 0)}"
+        if st.session_state.document_signature == document_signature and st.session_state.document_text:
+            text = st.session_state.document_text
+            st.session_state.input_text = text
+            st.markdown('<div class="panel-title" style="margin-top:1rem;">Extracted Text</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="output-box">{html.escape(text[:3000])}</div>', unsafe_allow_html=True)
+        else:
+            st.session_state.input_text = ""
+            st.info("Click Generate Summary to extract text and summarize this document.")
 
 else:
     st.markdown('<div class="panel-title">Video Upload</div>', unsafe_allow_html=True)
@@ -2257,6 +2405,38 @@ with action_right:
     )
 
 if generate_clicked:
+    if option == "Upload File" and text.strip() == "" and uploaded_file is not None:
+        document_signature = f"{uploaded_file.name}:{getattr(uploaded_file, 'size', 0)}"
+
+        if st.session_state.document_signature == document_signature and st.session_state.document_text:
+            text = st.session_state.document_text
+            st.session_state.input_text = text
+        else:
+            file_name = uploaded_file.name.lower()
+            with st.spinner("Extracting document text... Scanned PDFs may take a few minutes."):
+                try:
+                    if file_name.endswith(".pdf"):
+                        text = extract_pdf(uploaded_file)
+                    elif file_name.endswith(".docx"):
+                        text = extract_docx(uploaded_file)
+                    elif file_name.endswith(".txt"):
+                        text = extract_txt(uploaded_file)
+                    else:
+                        text = ""
+                except Exception as error:
+                    text = ""
+                    st.error(f"I could not extract this document: {error}")
+
+                if file_name.endswith(".pdf") and text:
+                    text = clean_ocr_text(text) or text
+                st.session_state.document_signature = document_signature
+                st.session_state.document_text = text
+                st.session_state.input_text = text
+
+        if text.strip():
+            st.markdown('<div class="panel-title" style="margin-top:1rem;">Extracted Text</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="output-box">{html.escape(text[:3000])}</div>', unsafe_allow_html=True)
+
     if (
         option == "Paste URL"
         and st.session_state.url_input
@@ -2307,6 +2487,11 @@ if generate_clicked:
             st.warning(st.session_state.url_warning or "Please enter a valid webpage or YouTube URL.")
         elif option == "Upload Video":
             st.warning("I could not detect speech in this video preview. If the video has music, long silent sections, or speech later in the file, try a shorter clip with speech near the beginning or paste a transcript.")
+        elif option == "Upload File" and uploaded_file is not None and uploaded_file.name.lower().endswith(".pdf"):
+            st.warning(
+                "I still could not read text from this PDF. It may be a low-quality scan, handwritten, protected, "
+                "or made from images that OCR cannot recognize clearly."
+            )
         else:
             st.warning("Please enter some text or upload a supported file.")
     else:
@@ -2320,6 +2505,10 @@ if generate_clicked:
                 use_abstractive=True,
             )
             summary = clean_summary_output(summary, text)
+            if has_summary_quality_issue(summary, text, summary_target_words):
+                fallback_text = clean_source_for_summary(text)
+                fallback_target = fallback_summary_target(len(fallback_text.split()), summary_target_words)
+                summary = clean_summary_output(extractive_summary(fallback_text, fallback_target), fallback_text)
 
         st.markdown('<div class="panel-title" style="margin-top:1.2rem;">Generated Summary</div>', unsafe_allow_html=True)
         st.markdown(f'<div class="output-box summary-box">{html.escape(summary)}</div>', unsafe_allow_html=True)
