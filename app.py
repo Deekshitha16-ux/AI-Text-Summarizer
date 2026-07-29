@@ -614,13 +614,12 @@ def transcribe_audio_file(audio_path, asr_model):
     if len(audio_array) == 0:
         return ""
 
-    transcript = asr_model(
-        {"array": audio_array, "sampling_rate": sample_rate},
-        chunk_length_s=VIDEO_CHUNK_SECONDS,
-        batch_size=VIDEO_BATCH_SIZE,
-        return_timestamps=False,
-        generate_kwargs={"task": "transcribe", "language": "english"},
-    )
+    pipeline_kwargs = {
+        "chunk_length_s": VIDEO_CHUNK_SECONDS,
+        "batch_size": VIDEO_BATCH_SIZE,
+        "return_timestamps": False,
+    }
+    transcript = asr_model({"array": audio_array, "sampling_rate": sample_rate}, **pipeline_kwargs)
     if isinstance(transcript, dict):
         return transcript.get("text", "").strip()
     return str(transcript).strip()
