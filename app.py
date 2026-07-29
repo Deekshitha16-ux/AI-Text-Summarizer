@@ -22,6 +22,9 @@ TESSERACT_TESSDATA_DIRS = (
     os.getenv("TESSDATA_PREFIX", ""),
     r"C:\Program Files\Tesseract-OCR\tessdata",
     r"C:\Program Files (x86)\Tesseract-OCR\tessdata",
+    "/usr/share/tesseract-ocr/5/tessdata",
+    "/usr/share/tesseract-ocr/4.00/tessdata",
+    "/usr/share/tesseract-ocr/tessdata",
 )
 ENABLE_YOUTUBE_AUDIO_FALLBACK = os.getenv("ENABLE_YOUTUBE_AUDIO_FALLBACK", "").lower() in {"1", "true", "yes"}
 VIDEO_CHUNK_SECONDS = 30
